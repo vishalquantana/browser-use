@@ -1495,9 +1495,9 @@ class BrowserContext:
 				logger.info(f'🔍  Locating element with CSS selector: {css_selector}')
 				element_handle = await current_frame.query_selector(css_selector)
 				if element_handle:
-					is_hidden = await element_handle.is_hidden()
-					logger.info(f'🔍  Element is hidden: {is_hidden}')
-					if not is_hidden:
+					is_visible = await element_handle.is_visible()
+					logger.info(f'🔍  Element is visible: {is_visible}')
+					if is_visible:
 						logger.info('🔍  Trying to scroll into view')
 						await element_handle.scroll_into_view_if_needed()
 					return element_handle
