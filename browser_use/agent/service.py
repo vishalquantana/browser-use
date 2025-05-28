@@ -27,6 +27,7 @@ from langchain_core.messages import (
 )
 from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import BaseModel, ValidationError
+from uuid_extensions import uuid7str
 
 from browser_use.agent.gif import create_history_gif
 from browser_use.agent.memory import Memory, MemoryConfig
@@ -403,6 +404,10 @@ class Agent(Generic[Context]):
 		# Telemetry
 		self.telemetry = ProductTelemetry()
 
+		# Generate unique IDs for this agent session and task
+		self.session_id: str = uuid7str()
+		self.task_id: str = uuid7str()
+
 		# Event bus
 		self.event_bus = EventBus(self)
 
@@ -778,6 +783,10 @@ class Agent(Generic[Context]):
 		return self._detect_best_tool_calling_method()
 
 	def add_new_task(self, new_task: str) -> None:
+		"""Add a new task to the agent, keeping the same task_id as tasks are continuous"""
+		# Simply delegate to message manager - no need for new task_id or events
+		# The task continues with new instructions, it doesn't end and start a new one
+		self.task = new_task
 		self._message_manager.add_new_task(new_task)
 
 	async def _raise_if_stopped_or_paused(self) -> None:
@@ -810,7 +819,7 @@ class Agent(Generic[Context]):
 			# Emit browser state updated event
 			if browser_state_summary:
 				state_event = SessionBrowserStateUpdatedEvent(
-					session_id=str(id(self)),
+					session_id=self.session_id,
 					current_url=browser_state_summary.url,
 					current_title=browser_state_summary.title,
 					active_tab_id=browser_state_summary.active_tab_idx if browser_state_summary.active_tab_idx is not None else 0,
@@ -992,8 +1001,8 @@ class Agent(Generic[Context]):
 
 				# First emit the StepCreatedEvent (for backward compatibility)
 				step_event = StepCreatedEvent(
-					step_id=f'{id(self)}_{self.state.n_steps}',
-					agent_task_id=str(id(self.task)),
+					step_id=f'{self.session_id}_{self.state.n_steps}',
+					agent_task_id=self.task_id,
 					step=self.state.n_steps,
 					evaluation_previous_goal=getattr(model_output, 'evaluation_previous_goal', ''),
 					memory=getattr(model_output, 'memory', ''),
@@ -1018,9 +1027,9 @@ class Agent(Generic[Context]):
 				extracted_content = next((r.extracted_content for r in result if r.extracted_content), None)
 
 				executed_event = StepExecutedEvent(
-					step_id=f'{id(self)}_{self.state.n_steps}',
-					task_id=str(id(self.task)),
-					session_id=str(id(self)),
+					step_id=f'{self.session_id}_{self.state.n_steps}',
+					task_id=self.task_id,
+					session_id=self.session_id,
 					step_number=self.state.n_steps,
 					# Action data
 					action_type=action_type,
@@ -1047,8 +1056,8 @@ class Agent(Generic[Context]):
 
 				# Emit performance metric event
 				perf_event = PerformanceMetricEvent(
-					session_id=str(id(self)),
-					task_id=str(id(self.task)),
+					session_id=self.session_id,
+					task_id=self.task_id,
 					metric_name='step_duration',
 					metric_value=step_duration,
 					metric_unit='seconds',
@@ -1073,9 +1082,9 @@ class Agent(Generic[Context]):
 		import traceback
 
 		error_event = ErrorTrackedEvent(
-			session_id=str(id(self)),
-			task_id=str(id(self.task)),
-			step_id=f'{id(self)}_{self.state.n_steps}' if self.state.n_steps else None,
+			session_id=self.session_id,
+			task_id=self.task_id,
+			step_id=f'{self.session_id}_{self.state.n_steps}' if self.state.n_steps else None,
 			error_type=error.__class__.__name__,
 			error_message=str(error),
 			stack_trace=traceback.format_exc() if include_trace else None,
@@ -1469,8 +1478,9 @@ class Agent(Generic[Context]):
 
 			# Emit session started event
 			self._session_start_time = time.time()
+			self._task_start_time = self._session_start_time  # Initialize task start time
 			session_started_event = SessionStartedEvent(
-				session_id=str(id(self)),  # Using object id as session identifier
+				session_id=self.session_id,
 				user_id='',  # To be filled by cloud handler
 				browser_type='chrome',  # Default to chrome
 				window_width=self.browser_profile.viewport.get('width', 1280)
@@ -1488,7 +1498,7 @@ class Agent(Generic[Context]):
 				context_metadata={
 					'browser_session_id': self.browser_session.session_id
 					if hasattr(self.browser_session, 'session_id')
-					else str(id(self.browser_session)),
+					else self.session_id,
 					'cookies': [],
 					'secrets': dict(self.sensitive_data) if self.sensitive_data else {},
 					'allowed_domains': self.browser_profile.allowed_domains if self.browser_profile else [],
@@ -1498,22 +1508,22 @@ class Agent(Generic[Context]):
 
 			# Also emit browser data updated event
 			browser_data_event = SessionBrowserDataUpdatedEvent(
-				session_id=str(id(self)),
+				session_id=self.session_id,
 				browser_session_data={
 					'cookies': [],
 					'secrets': dict(self.sensitive_data) if self.sensitive_data else {},
 					'allowed_domains': self.browser_profile.allowed_domains if self.browser_profile else [],
 					'browser_session_id': self.browser_session.session_id
 					if hasattr(self.browser_session, 'session_id')
-					else str(id(self.browser_session)),
+					else self.session_id,
 				},
 			)
 			self.event_bus.emit(browser_data_event)
 
 			# Emit task started event
 			task_started_event = TaskStartedEvent(
-				task_id=str(id(self.task)),  # Using task object id as identifier
-				session_id=str(id(self)),
+				task_id=self.task_id,
+				session_id=self.session_id,
 				task_description=self.task,
 				task_type='other',  # Default to other, could be inferred from task
 				max_steps=max_steps,
@@ -1572,10 +1582,10 @@ class Agent(Generic[Context]):
 
 					# Emit task completed event
 					done_output = self.state.history.get_last_done_output()
-					task_duration = time.time() - self._session_start_time
+					task_duration = time.time() - self._task_start_time
 					task_completed_event = TaskCompletedEvent(
-						task_id=str(id(self.task)),
-						session_id=str(id(self)),
+						task_id=self.task_id,
+						session_id=self.session_id,
 						status='completed',
 						success=True,
 						result_summary=done_output if done_output else '',
@@ -1594,8 +1604,8 @@ class Agent(Generic[Context]):
 							unique_urls.add(h.state.url.split('?')[0])  # Remove query params
 
 					analytics_event = TaskAnalyticsEvent(
-						task_id=str(id(self.task)),
-						session_id=str(id(self)),
+						task_id=self.task_id,
+						session_id=self.session_id,
 						# Success metrics
 						success_rate=1.0 if total_errors == 0 else (self.state.n_steps - total_errors) / self.state.n_steps,
 						steps_to_completion=self.state.n_steps,
@@ -1710,8 +1720,8 @@ class Agent(Generic[Context]):
 					file_size = os.path.getsize(file_path) if file_path.exists() else 0
 
 					output_event = OutputFileGeneratedEvent(
-						task_id=str(id(self.task)),
-						session_id=str(id(self)),
+						task_id=self.task_id,
+						session_id=self.session_id,
 						filename=file_path.name,
 						mime_type='text/x-python',
 						size_bytes=file_size,
@@ -1731,7 +1741,7 @@ class Agent(Generic[Context]):
 			# Emit session stopped event
 			session_start_time = getattr(self, '_session_start_time', time.time())
 			session_stopped_event = SessionStoppedEvent(
-				session_id=str(id(self)),
+				session_id=self.session_id,
 				reason='completed' if not agent_run_error else ('error' if 'Exception' in agent_run_error else 'user_cancelled'),
 				error_message=agent_run_error if agent_run_error else None,
 				total_duration_seconds=time.time() - session_start_time,
@@ -1762,8 +1772,8 @@ class Agent(Generic[Context]):
 					gif_size = os.path.getsize(gif_path)
 
 					gif_event = OutputFileGeneratedEvent(
-						task_id=str(id(self.task)),
-						session_id=str(id(self)),
+						task_id=self.task_id,
+						session_id=self.session_id,
 						filename=gif_path.name,
 						mime_type='image/gif',
 						size_bytes=gif_size,
@@ -2054,9 +2064,7 @@ class Agent(Generic[Context]):
 
 		# Emit task paused event
 		self.event_bus.emit(
-			TaskPausedEvent(
-				task_id=str(id(self.task)), session_id=str(id(self)), reason='User interrupted (Ctrl+C)', can_resume=True
-			)
+			TaskPausedEvent(task_id=self.task_id, session_id=self.session_id, reason='User interrupted (Ctrl+C)', can_resume=True)
 		)
 
 		# The signal handler will handle the asyncio pause logic for us
@@ -2070,7 +2078,7 @@ class Agent(Generic[Context]):
 		self._external_pause_event.set()
 
 		# Emit task resumed event
-		self.event_bus.emit(TaskResumedEvent(task_id=str(id(self.task)), session_id=str(id(self))))
+		self.event_bus.emit(TaskResumedEvent(task_id=self.task_id, session_id=self.session_id))
 
 		# The signal handler should have already reset the flags
 		# through its reset() method when called from run()
@@ -2089,7 +2097,7 @@ class Agent(Generic[Context]):
 		self.state.stopped = True
 
 		# Emit task stopped event
-		self.event_bus.emit(TaskStoppedEvent(task_id=str(id(self.task))))
+		self.event_bus.emit(TaskStoppedEvent(task_id=self.task_id))
 
 	def _convert_initial_actions(self, actions: list[dict[str, dict[str, Any]]]) -> list[ActionModel]:
 		"""Convert dictionary-based actions to ActionModel instances"""
