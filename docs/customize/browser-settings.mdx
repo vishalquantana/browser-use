@@ -173,6 +173,7 @@ It allows you do do things like start multiple browser processes with *some* sha
 from browser_use.browser import BrowserProfile
 
 base_config = BrowserProfile(
+    stealth=True,
     storage_state='/tmp/auth.json',
     allowed_domains=['https://*.google.com', 'https://*.example.com'],
     headless=True,
@@ -198,6 +199,13 @@ keep_alive: bool | None = None
 ```
 
 Keeps the browser alive after the agent has finished running. Useful for running multiple tasks with the same browser instance. If this is left as `None` and the Agent launched its own browser, the default is to close the browser after the agent completes. If the agent connected to an existing browser then it will leave it open.
+
+#### `stealth`
+
+```python
+stealth: bool = False
+```
+Set to `True` to use [`patchright`](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) to avoid bot-blocking. (Might cause issues with some sites, requires manual testing.)
 
 <a name="restrict-urls"></a>
 
