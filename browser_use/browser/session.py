@@ -249,9 +249,14 @@ class BrowserSession(BaseModel):
 
 		async with self._start_lock:
 			# if we're already initialized and the connection is still valid, return the existing session state and start from scratch
-			if self.initialized and self.is_connected():
-				return self
-			self._reset_connection_state()
+			if self.initialized:
+				if self.is_connected():
+					return self
+				else:
+					# only reset connection state if we expected to be already connected but we're not
+					# avoid calling this on *first* start() as it just immediately clears many
+					# of the params passed in to BrowserSession(...) init, which the .setup_...() methods below expect
+					self._reset_connection_state()
 
 			self.initialized = True  # set this first to ensure two parallel calls to start() don't clash with each other
 			try:
@@ -863,8 +868,22 @@ class BrowserSession(BaseModel):
 		self.initialized = False
 		self.browser = None
 		self.browser_context = None
-		# Also clear browser_pid since the process may no longer exist
-		self.browser_pid = None
+		self.agent_current_page = None
+		self.human_current_page = None
+		self._cached_clickable_element_hashes = None
+		self._cached_browser_state_summary = None
+		if self.browser_pid:
+			try:
+				# browser_pid is different from all the other state objects, it's closer to cdp_url or wss_url
+				# because we might still be able to reconnect to the same browser even if self.browser_context died
+				# if we have a self.browser_pid, check if it's still alive and serving a remote debugging port
+				# if so, don't clear it because there's a chance we can re-use it by just reconnecting to the same pid's port
+				proc = psutil.Process(self.browser_pid)
+				proc_is_alive = proc.status() not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+				assert proc_is_alive and '--remote-debugging-port' in ' '.join(proc.cmdline())
+			except Exception:
+				# process has gone away or crashed, pid is no longer valid so we clear it
+				self.browser_pid = None
 
 	# --- Tab management ---
 	async def get_current_page(self) -> Page:
