@@ -7,6 +7,7 @@ from browser_use.agent.event_bus.cloud_events import (
 	SessionStartedEvent,
 	SessionStoppedEvent,
 	StepCreatedEvent,
+	StepExecutedEvent,
 	TaskCompletedEvent,
 	TaskPausedEvent,
 	TaskResumedEvent,

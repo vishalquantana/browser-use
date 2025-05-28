@@ -37,6 +37,7 @@ from browser_use.agent.event_bus import (
 	TaskPausedEvent,
 	TaskResumedEvent,
 	TaskStartedEvent,
+	TaskStoppedEvent,
 )
 from browser_use.agent.gif import create_history_gif
 from browser_use.agent.memory import Memory, MemoryConfig
@@ -393,7 +394,7 @@ class Agent(Generic[Context]):
 		self.telemetry = ProductTelemetry()
 
 		# Event bus
-		self.event_bus = EventBus()
+		self.event_bus = EventBus(self)
 
 		if self.settings.save_conversation_path:
 			logger.info(f'Saving conversation to {self.settings.save_conversation_path}')
@@ -1363,6 +1364,9 @@ class Agent(Generic[Context]):
 		try:
 			self._log_agent_run()
 
+			# Start the event bus
+			await self.event_bus.start()
+
 			# Emit session started event
 			session_started_event = SessionStartedEvent(
 				session_id=id(self),  # Using object id as session identifier
@@ -1517,6 +1521,12 @@ class Agent(Generic[Context]):
 				browser_session_stopped_at=time.time(),
 			)
 			self.event_bus.emit(session_stopped_event)
+
+			# Wait for all events to be processed
+			await self.event_bus.wait_for_empty_queue()
+
+			# Stop the event bus
+			await self.event_bus.stop()
 
 			await self.close()
 
@@ -1836,6 +1846,9 @@ class Agent(Generic[Context]):
 		"""Stop the agent"""
 		logger.info('⏹️ Agent stopping')
 		self.state.stopped = True
+
+		# Emit task stopped event
+		self.event_bus.emit(TaskStoppedEvent(task_id=id(self.task)))
 
 	def _convert_initial_actions(self, actions: list[dict[str, dict[str, Any]]]) -> list[ActionModel]:
 		"""Convert dictionary-based actions to ActionModel instances"""

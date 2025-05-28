@@ -1,198 +1,356 @@
 import asyncio
+import inspect
 import json
+import logging
 from collections import defaultdict
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
+
+from pydantic import BaseModel
 
 from browser_use.agent.event_bus.views import Event
 
-EventHandler = Callable[[Event], None] | Callable[[Event], Coroutine[Any, Any, None]]
+logger = logging.getLogger(__name__)
+
+# Type alias for event handlers
+EventHandler = Union[Callable[[Event, Any], Any], Callable[[Event, Any], Awaitable[Any]]]
 
 
 class EventBus:
-	"""Event bus for managing and dispatching events"""
+	"""
+	Async event bus with write-ahead logging and guaranteed FIFO processing.
 
-	def __init__(self, store_events: bool = True):
-		self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
-		self._all_handlers: list[EventHandler] = []
-		self._events: list[Event] = []
-		self._store_events = store_events
-		self._lock = asyncio.Lock()
-		self._pending_tasks: set[asyncio.Task] = set()
+	Features:
+	- Sync and async event enqueueing
+	- Blocking and non-blocking dispatch
+	- Write-ahead logging with UUIDs and timestamps
+	- FIFO event processing
+	- Parallel handler execution per event
+	- Serial event processing
+	"""
 
-	def register_handler(self, event_type: str | None, handler: EventHandler) -> None:
-		"""Register a handler for specific event type or all events
+	def __init__(self, agent_object: Any):
+		self.agent = agent_object
+		self.event_queue: asyncio.Queue[Event] = asyncio.Queue()
+		self.write_ahead_log: list[Event] = []
+		self.handlers: dict[str, list[EventHandler]] = defaultdict(list)
+		self.all_event_handlers: list[EventHandler] = []
+		self.running = False
+		self.runner_task: asyncio.Task | None = None
+		self.lock = asyncio.Lock()
 
-		Args:
-			event_type: Event type to listen for, or None for all events
-			handler: Sync or async function to handle the event
+		# Register default logger handler
+		self.subscribe_to_all(self._default_log_handler)
+
+	async def _default_log_handler(self, event: Event, agent: Any) -> str:
+		"""Default handler that logs all events"""
+		logger.debug(f'Event processed: {event.event_type} [{event.event_id}] - {event.model_dump_json()}')
+		return 'logged'
+
+	def subscribe(self, event_type: str, handler: EventHandler) -> None:
+		"""Subscribe a handler to a specific event type"""
+		if not inspect.iscoroutinefunction(handler):
+			raise ValueError('Handler must be an async function')
+		self.handlers[event_type].append(handler)
+
+	def subscribe_by_model(self, event_model: type[BaseModel], handler: EventHandler) -> None:
+		"""Subscribe a handler to a specific event model type"""
+		self.subscribe(event_model.__name__, handler)
+
+	def subscribe_to_all(self, handler: EventHandler) -> None:
+		"""Subscribe a handler to all event types"""
+		if not inspect.iscoroutinefunction(handler):
+			raise ValueError('Handler must be an async function')
+		self.all_event_handlers.append(handler)
+
+	def _log_event(self, event: Event) -> Event:
+		"""Log an event to the write-ahead log"""
+		self.write_ahead_log.append(event)
+		return event
+
+	async def enqueue(self, event: BaseModel) -> Event:
 		"""
-		if event_type is None:
-			self._all_handlers.append(handler)
-		else:
-			self._handlers[event_type].append(handler)
-
-	def unregister_handler(self, event_type: str | None, handler: EventHandler) -> None:
-		"""Unregister a handler
-
-		Args:
-			event_type: Event type the handler was registered for
-			handler: Handler to remove
+		Enqueue an event (non-blocking).
+		Returns the event object immediately with UUID but no results.
+		Can be awaited to get results when processing completes.
 		"""
-		if event_type is None:
-			if handler in self._all_handlers:
-				self._all_handlers.remove(handler)
-		else:
-			if handler in self._handlers[event_type]:
-				self._handlers[event_type].remove(handler)
+		# Convert BaseModel to Event if needed
+		if not isinstance(event, Event):
+			# Create Event from the BaseModel
+			event_data = event.model_dump()
+			event = Event(event_type=event.__class__.__name__, data=event_data)
 
-	def emit(self, event: Event) -> None:
-		"""Queue an event for processing. Can be called from sync or async context.
+		self._log_event(event)
+		await self.event_queue.put(event)
+		return event
 
-		This method queues the event and, if in an async context, schedules
-		the handlers to run asynchronously. If in a sync context, the event
-		is only queued and handlers will run when the event loop is available.
-
-		Args:
-			event: Event to emit
+	def enqueue_sync(self, event: BaseModel) -> Event:
 		"""
-		# Always store event if enabled
-		if self._store_events:
-			self._events.append(event)
+		Enqueue an event from sync context (non-blocking).
+		Returns the event object immediately with UUID but no results.
+		"""
+		# Convert BaseModel to Event if needed
+		if not isinstance(event, Event):
+			# Create Event from the BaseModel
+			event_data = event.model_dump()
+			event = Event(event_type=event.__class__.__name__, data=event_data)
 
-		# Try to get the current event loop
+		self._log_event(event)
+
+		# Get or create event loop
 		try:
 			loop = asyncio.get_running_loop()
-			# We're in an async context, schedule the async emit
-			task = asyncio.create_task(self._process_event(event))
-			# Store the task to prevent it from being garbage collected
-			self._pending_tasks.add(task)
-			task.add_done_callback(self._pending_tasks.discard)
+			# If loop is running, schedule the coroutine
+			asyncio.create_task(self.event_queue.put(event))
 		except RuntimeError:
-			# No event loop running, event is queued for later processing
+			# No event loop in current thread
 			pass
 
-	async def _process_event(self, event: Event) -> None:
-		"""Process a single event by calling all its handlers"""
-		# Collect all relevant handlers
-		handlers = list(self._all_handlers)
-		if event.event_type in self._handlers:
-			handlers.extend(self._handlers[event.event_type])
+		return event
 
-		# Execute handlers
-		tasks = []
-		for handler in handlers:
-			if asyncio.iscoroutinefunction(handler):
-				tasks.append(self._execute_async_handler(handler, event))
+	async def enqueue_and_wait(self, event: BaseModel) -> Event:
+		"""
+		Enqueue an event and wait for all handlers to complete (blocking).
+		Returns the event object with results included.
+		"""
+		event_obj = await self.enqueue(event)
+		await event_obj.wait_for_completion()
+		return event_obj
+
+	def enqueue_and_wait_sync(self, event: BaseModel) -> Event:
+		"""
+		Enqueue an event and wait for all handlers to complete from sync context (blocking).
+		Returns the event object with results included.
+		"""
+		# Check if there's a running event loop
+		try:
+			loop = asyncio.get_running_loop()
+			# If we get here, we're in an async context
+			raise RuntimeError('Cannot call enqueue_and_wait_sync from within running event loop. Use enqueue_and_wait instead.')
+		except RuntimeError as e:
+			# Check the specific error message
+			error_msg = str(e).lower()
+			if 'no running loop' in error_msg or 'no current event loop' in error_msg or 'no running event loop' in error_msg:
+				# No event loop in current thread, create a new one
+				loop = asyncio.new_event_loop()
+				asyncio.set_event_loop(loop)
+				try:
+					return loop.run_until_complete(self.enqueue_and_wait(event))
+				finally:
+					# Clean up the loop
+					loop.close()
+					asyncio.set_event_loop(None)
 			else:
-				tasks.append(self._execute_sync_handler(handler, event))
+				# Some other error, re-raise
+				raise
+
+	async def enqueue_batch_and_wait(self, events: list[BaseModel]) -> list[Event]:
+		"""
+		Enqueue a list of events and wait for all of them to complete (blocking).
+		Events are processed in FIFO order but this method waits for all to finish.
+		Returns a list of completed event objects with results included.
+		"""
+		if not events:
+			return []
+
+		# Enqueue all events (non-blocking)
+		event_objects = []
+		for event in events:
+			event_obj = await self.enqueue(event)
+			event_objects.append(event_obj)
+
+		# Wait for all events to complete
+		await asyncio.gather(*[event_obj.wait_for_completion() for event_obj in event_objects])
+
+		return event_objects
+
+	def enqueue_batch_and_wait_sync(self, events: list[BaseModel]) -> list[Event]:
+		"""
+		Enqueue a list of events and wait for all of them to complete from sync context (blocking).
+		Events are processed in FIFO order but this method waits for all to finish.
+		Returns a list of completed event objects with results included.
+		"""
+		# Check if there's a running event loop
+		try:
+			loop = asyncio.get_running_loop()
+			# If we get here, we're in an async context
+			raise RuntimeError(
+				'Cannot call enqueue_batch_and_wait_sync from within running event loop. Use enqueue_batch_and_wait instead.'
+			)
+		except RuntimeError as e:
+			# Check the specific error message
+			error_msg = str(e).lower()
+			if 'no running loop' in error_msg or 'no current event loop' in error_msg or 'no running event loop' in error_msg:
+				# No event loop in current thread, create a new one
+				loop = asyncio.new_event_loop()
+				asyncio.set_event_loop(loop)
+				try:
+					return loop.run_until_complete(self.enqueue_batch_and_wait(events))
+				finally:
+					# Clean up the loop
+					loop.close()
+					asyncio.set_event_loop(None)
+			else:
+				# Some other error, re-raise
+				raise
+
+	async def _execute_handlers(self, event: Event) -> None:
+		"""Execute all handlers for an event in parallel"""
+		# Get all applicable handlers
+		applicable_handlers = []
+
+		# Add type-specific handlers
+		applicable_handlers.extend(self.handlers.get(event.event_type, []))
+
+		# Add all-event handlers
+		applicable_handlers.extend(self.all_event_handlers)
+
+		if not applicable_handlers:
+			return
+
+		# Execute all handlers in parallel
+		tasks = []
+		for handler in applicable_handlers:
+			task = asyncio.create_task(self._safe_execute_handler(handler, event))
+			tasks.append((handler.__name__, task))
 
 		# Wait for all handlers to complete
-		if tasks:
-			await asyncio.gather(*tasks, return_exceptions=True)
+		for handler_name, task in tasks:
+			try:
+				result = await task
+				event.results[handler_name] = result
+			except Exception as e:
+				event.errors[handler_name] = e
+				logger.error(f'Handler {handler_name} failed for event {event.event_id}: {e}')
 
-	async def _execute_async_handler(self, handler: EventHandler, event: Event) -> None:
-		"""Execute async handler with error handling"""
+	async def _safe_execute_handler(self, handler: EventHandler, event: Event) -> Any:
+		"""Safely execute a single handler"""
 		try:
-			await handler(event)
+			return await handler(event, self.agent)
 		except Exception as e:
-			self._log_handler_error(handler, event, e)
+			logger.exception(f'Error in handler {handler.__name__} for event {event.event_id}')
+			raise
 
-	async def _execute_sync_handler(self, handler: EventHandler, event: Event) -> None:
-		"""Execute sync handler in thread pool with error handling"""
+	async def _step(self) -> None:
+		"""Process a single event from the queue"""
 		try:
-			loop = asyncio.get_event_loop()
-			await loop.run_in_executor(None, handler, event)
+			# Get next event (this will block if queue is empty)
+			event = await self.event_queue.get()
+
+			# Record start time
+			event.started_at = datetime.utcnow()
+
+			# Execute all handlers for this event
+			await self._execute_handlers(event)
+
+			# Mark event as completed
+			event.mark_completed()
+
+			# Mark task as done
+			self.event_queue.task_done()
+
 		except Exception as e:
-			self._log_handler_error(handler, event, e)
+			logger.exception(f'Error processing event: {e}')
 
-	def _log_handler_error(self, handler: EventHandler, event: Event, error: Exception) -> None:
-		"""Log handler execution error"""
-		handler_name = getattr(handler, '__name__', str(handler))
-		print(f"Error in event handler '{handler_name}' for event {event.event_type}: {error}")
+	async def _run_loop(self) -> None:
+		"""Main event processing loop"""
+		while self.running:
+			try:
+				async with self.lock:
+					await self._step()
+			except asyncio.CancelledError:
+				break
+			except Exception as e:
+				logger.exception(f'Error in event loop: {e}')
+				# Continue running even if there's an error
 
-	def get_events(self) -> list[Event]:
-		"""Get all stored events"""
-		return list(self._events)
+	async def start(self) -> None:
+		"""Start the event bus processing loop"""
+		if self.running:
+			return
 
-	def clear_events(self) -> None:
-		"""Clear stored events"""
-		self._events.clear()
+		self.running = True
+		self.runner_task = asyncio.create_task(self._run_loop())
+		logger.info('EventBus started')
+
+	async def stop(self) -> None:
+		"""Stop the event bus processing loop"""
+		if not self.running:
+			return
+
+		self.running = False
+
+		if self.runner_task:
+			self.runner_task.cancel()
+			try:
+				await self.runner_task
+			except asyncio.CancelledError:
+				pass
+
+		logger.info('EventBus stopped')
+
+	async def wait_for_empty_queue(self) -> None:
+		"""Wait for all queued events to be processed"""
+		await self.event_queue.join()
+
+	def get_event_log(self) -> list[Event]:
+		"""Get the write-ahead log of all events"""
+		return self.write_ahead_log.copy()
 
 	async def serialize_events_to_file(self, file_path: Path | str) -> None:
 		"""Serialize all events to a JSON file
 
 		Args:
-			file_path: Path to write events to
+			file_path: Path to save the events to
 		"""
 		file_path = Path(file_path)
-
-		# Ensure parent directory exists
-		file_path.parent.mkdir(parents=True, exist_ok=True)
-
-		# Convert events to dicts
 		events_data = []
-		async with self._lock:
-			for event in self._events:
-				event_dict = event.model_dump(mode='json')
-				# Ensure datetime is serialized properly
-				if 'timestamp' in event_dict and isinstance(event_dict['timestamp'], datetime):
-					event_dict['timestamp'] = event_dict['timestamp'].isoformat()
-				events_data.append(event_dict)
 
-		# Write to file
+		for event in self.write_ahead_log:
+			event_dict = event.model_dump()
+			# Convert datetime objects to ISO format strings
+			for key in ['timestamp', 'started_at', 'completed_at']:
+				if key in event_dict and event_dict[key]:
+					event_dict[key] = event_dict[key].isoformat()
+
+			# Convert exception objects to strings in errors dict
+			if 'errors' in event_dict:
+				event_dict['errors'] = {k: str(v) for k, v in event_dict['errors'].items()}
+
+			events_data.append(event_dict)
+
+		async with asyncio.Lock():
+			with open(file_path, 'w') as f:
+				json.dump(events_data, f, indent=2, default=str)
+
+	def serialize_events_to_file_sync(self, file_path: Path | str) -> None:
+		"""Serialize all events to a JSON file (sync version)
+
+		Args:
+			file_path: Path to save the events to
+		"""
+		file_path = Path(file_path)
+		events_data = []
+
+		for event in self.write_ahead_log:
+			event_dict = event.model_dump()
+			# Convert datetime objects to ISO format strings
+			for key in ['timestamp', 'started_at', 'completed_at']:
+				if key in event_dict and event_dict[key]:
+					event_dict[key] = event_dict[key].isoformat()
+
+			# Convert exception objects to strings in errors dict
+			if 'errors' in event_dict:
+				event_dict['errors'] = {k: str(v) for k, v in event_dict['errors'].items()}
+
+			events_data.append(event_dict)
+
 		with open(file_path, 'w') as f:
 			json.dump(events_data, f, indent=2, default=str)
 
-		self._log_serialization_complete(file_path, len(events_data))
-
-	def _log_serialization_complete(self, file_path: Path, event_count: int) -> None:
-		"""Log successful serialization"""
-		print(f'Serialized {event_count} events to {file_path}')
-
-	async def load_events_from_file(self, file_path: Path | str) -> list[Event]:
-		"""Load events from a JSON file
-
-		Args:
-			file_path: Path to read events from
-
-		Returns:
-			List of loaded events
-		"""
-		file_path = Path(file_path)
-
-		if not file_path.exists():
-			raise FileNotFoundError(f'Event file not found: {file_path}')
-
-		with open(file_path) as f:
-			events_data = json.load(f)
-
-		# Convert back to Event objects
-		loaded_events = []
-		for event_dict in events_data:
-			# Parse timestamp if it's a string
-			if 'timestamp' in event_dict and isinstance(event_dict['timestamp'], str):
-				event_dict['timestamp'] = datetime.fromisoformat(event_dict['timestamp'])
-
-			# Create generic Event - in real usage, you'd map event_type to specific classes
-			event = Event(**event_dict)
-			loaded_events.append(event)
-
-		return loaded_events
-
-	def decorator(self, event_type: str | None = None):
-		"""Decorator for registering event handlers
-
-		Usage:
-			@event_bus.decorator('step_started')
-			async def on_step_started(event: StepStartedEvent):
-				print(f"Step {event.step_number} started")
-		"""
-
-		def wrapper(handler: EventHandler) -> EventHandler:
-			self.register_handler(event_type, handler)
-			return handler
-
-		return wrapper
+	# Convenience method that matches the old API
+	def emit(self, event: BaseModel) -> Event:
+		"""Queue an event for processing. Can be called from sync or async context."""
+		return self.enqueue_sync(event)

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -6,14 +7,44 @@ from uuid_extensions import uuid7str
 
 
 class Event(BaseModel):
-	"""Base event class for all event types"""
+	"""Base event model that gets passed through the event bus"""
 
-	model_config = ConfigDict(extra='forbid', validate_assignment=True)
+	model_config = ConfigDict(extra='forbid', validate_assignment=True, arbitrary_types_allowed=True)
 
 	event_id: str = Field(default_factory=uuid7str)
-	event_type: str
+	event_type: str = Field(default='Event')
 	timestamp: datetime = Field(default_factory=datetime.utcnow)
 	data: dict[str, Any] = Field(default_factory=dict)
+
+	# Completion tracking fields
+	started_at: datetime | None = None
+	completed_at: datetime | None = None
+	results: dict[str, Any] = Field(default_factory=dict)
+	errors: dict[str, Exception] = Field(default_factory=dict)
+
+	# Internal field for completion tracking (excluded from serialization)
+	completion_event: asyncio.Event | None = Field(default=None, exclude=True)
+
+	def model_post_init(self, __context: Any) -> None:
+		"""Initialize completion event after model creation"""
+		try:
+			# Only create event if we're in an async context
+			asyncio.get_running_loop()
+			self.completion_event = asyncio.Event()
+		except RuntimeError:
+			# Not in async context, skip
+			self.completion_event = None
+
+	async def wait_for_completion(self) -> None:
+		"""Wait for this event to be fully processed"""
+		if self.completion_event:
+			await self.completion_event.wait()
+
+	def mark_completed(self) -> None:
+		"""Mark this event as completed"""
+		self.completed_at = datetime.utcnow()
+		if self.completion_event:
+			self.completion_event.set()
 
 
 # Agent lifecycle events
@@ -64,6 +95,17 @@ class StepFailedEvent(Event):
 	error: str
 	error_type: str | None = None
 	retry_count: int = 0
+
+
+class ActionExecutedEvent(Event):
+	"""Emitted when an action is executed"""
+
+	event_type: str = Field(default='action_executed', frozen=True)
+	action_id: str = Field(default_factory=uuid7str)
+	action_type: str
+	params: dict[str, Any] = Field(default_factory=dict)
+	result: Any | None = None
+	duration_ms: float | None = None
 
 
 # State change events

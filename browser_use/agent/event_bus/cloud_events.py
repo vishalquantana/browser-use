@@ -113,6 +113,45 @@ class TaskResumedEvent(Event):
 	checkpoint_data: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskStoppedEvent(Event):
+	"""Emitted when a task is stopped"""
+
+	event_type: str = Field(default='task_stopped', frozen=True)
+	task_id: str
+
+
+class StepCreatedEvent(Event):
+	"""Emitted when a step is created"""
+
+	event_type: str = Field(default='step_created', frozen=True)
+	step_id: str
+	agent_task_id: str
+	step: int
+	evaluation_previous_goal: str
+	memory: str
+	next_goal: str
+	actions: list[dict[str, Any]]
+	screenshot_url: str
+	url: str
+
+
+class TaskUserFeedbackEvent(Event):
+	"""Emitted when user provides feedback on a task"""
+
+	event_type: str = Field(default='task_user_feedback', frozen=True)
+	task_id: str
+	user_feedback_type: str
+	user_comment: str | None = None
+
+
+class SessionBrowserDataUpdatedEvent(Event):
+	"""Emitted when browser session data is updated"""
+
+	event_type: str = Field(default='session_browser_data_updated', frozen=True)
+	session_id: str
+	browser_session_data: dict[str, Any]
+
+
 # Step events with evaluation data
 class StepExecutedEvent(Event):
 	"""Emitted when a step is executed with full evaluation data"""
