@@ -28,6 +28,16 @@ from langchain_core.messages import (
 from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import BaseModel, ValidationError
 
+from browser_use.agent.event_bus import (
+	EventBus,
+	SessionStartedEvent,
+	SessionStoppedEvent,
+	StepCreatedEvent,
+	TaskCompletedEvent,
+	TaskPausedEvent,
+	TaskResumedEvent,
+	TaskStartedEvent,
+)
 from browser_use.agent.gif import create_history_gif
 from browser_use.agent.memory import Memory, MemoryConfig
 from browser_use.agent.message_manager.service import MessageManager, MessageManagerSettings
@@ -107,7 +117,7 @@ class Agent(Generic[Context]):
 		browser_session: BrowserSession | None = None,
 		controller: Controller[Context] = Controller(),
 		# Initial agent run parameters
-		sensitive_data: dict[str, str | dict[str, str]] | None = None,
+		sensitive_data: dict[str, str] | dict[str, dict[str, str]] | None = None,
 		initial_actions: list[dict[str, dict[str, Any]]] | None = None,
 		# Cloud Callbacks
 		register_new_step_callback: (
@@ -381,6 +391,9 @@ class Agent(Generic[Context]):
 
 		# Telemetry
 		self.telemetry = ProductTelemetry()
+
+		# Event bus
+		self.event_bus = EventBus()
 
 		if self.settings.save_conversation_path:
 			logger.info(f'Saving conversation to {self.settings.save_conversation_path}')
@@ -945,6 +958,28 @@ class Agent(Generic[Context]):
 			# Log step completion summary
 			self._log_step_completion_summary(step_start_time, result)
 
+			# Emit step created event
+			if browser_state_summary and model_output:
+				# Extract key step data for the event
+				actions_data = []
+				if model_output.action:
+					for action in model_output.action:
+						action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+						actions_data.append(action_dict)
+
+				step_event = StepCreatedEvent(
+					step_id=f'{id(self)}_{self.state.n_steps}',
+					agent_task_id=id(self.task),
+					step=self.state.n_steps,
+					evaluation_previous_goal=getattr(model_output, 'evaluation_previous_goal', ''),
+					memory=getattr(model_output, 'memory', ''),
+					next_goal=getattr(model_output, 'next_goal', ''),
+					actions=actions_data,
+					screenshot_url='',  # To be filled by cloud handler if applicable
+					url=browser_state_summary.url,
+				)
+				self.event_bus.emit(step_event)
+
 	@time_execution_async('--handle_step_error (agent)')
 	async def _handle_step_error(self, error: Exception) -> list[ActionResult]:
 		"""Handle all types of errors that can occur during a step"""
@@ -1328,6 +1363,36 @@ class Agent(Generic[Context]):
 		try:
 			self._log_agent_run()
 
+			# Emit session started event
+			session_started_event = SessionStartedEvent(
+				session_id=id(self),  # Using object id as session identifier
+				user_id='',  # To be filled by cloud handler
+				browser_session_id=self.browser_session.session_id
+				if hasattr(self.browser_session, 'session_id')
+				else str(id(self.browser_session)),
+				browser_session_live_url='',  # To be filled by cloud handler if applicable
+				browser_session_cdp_url='',  # To be filled by cloud handler if applicable
+				browser_state={},  # Initial state
+				browser_session_data={
+					'cookies': [],
+					'secrets': dict(self.sensitive_data) if self.sensitive_data else {},
+					'allowed_domains': self.browser_profile.allowed_domains,
+				}
+				if self.browser_profile
+				else {},
+			)
+			self.event_bus.emit(session_started_event)
+
+			# Emit task started event
+			task_started_event = TaskStartedEvent(
+				task_id=id(self.task),  # Using task object id as identifier
+				agent_session_id=id(self),
+				task=self.task,
+				llm_model=self.model_name,
+				agent_state=self.state.model_dump() if hasattr(self.state, 'model_dump') else {},
+			)
+			self.event_bus.emit(task_started_event)
+
 			# Execute initial actions if provided
 			if self.initial_actions:
 				result = await self.multi_act(self.initial_actions, check_for_new_elements=False)
@@ -1372,6 +1437,16 @@ class Agent(Generic[Context]):
 							continue
 
 					await self.log_completion()
+
+					# Emit task completed event
+					done_output = self.state.history.get_last_done_output()
+					task_completed_event = TaskCompletedEvent(
+						task_id=id(self.task),
+						done_output=done_output if done_output else '',
+						gif_url='',  # To be filled by cloud handler if applicable
+						finished_at=time.time(),
+					)
+					self.event_bus.emit(task_completed_event)
 					break
 			else:
 				agent_run_error = 'Failed to complete task in maximum steps'
@@ -1435,6 +1510,13 @@ class Agent(Generic[Context]):
 				except Exception as script_gen_err:
 					# Log any error during script generation/saving
 					logger.error(f'Failed to save Playwright script: {script_gen_err}', exc_info=True)
+
+			# Emit session stopped event
+			session_stopped_event = SessionStoppedEvent(
+				session_id=id(self),
+				browser_session_stopped_at=time.time(),
+			)
+			self.event_bus.emit(session_stopped_event)
 
 			await self.close()
 
@@ -1719,6 +1801,9 @@ class Agent(Generic[Context]):
 		self.state.paused = True
 		self._external_pause_event.clear()
 
+		# Emit task paused event
+		self.event_bus.emit(TaskPausedEvent(task_id=id(self.task)))
+
 		# The signal handler will handle the asyncio pause logic for us
 		# No need to duplicate the code here
 
@@ -1728,6 +1813,13 @@ class Agent(Generic[Context]):
 		print('▶️  Got Enter, resuming agent execution where it left off...\n')
 		self.state.paused = False
 		self._external_pause_event.set()
+
+		# Emit task resumed event
+		if asyncio.iscoroutinefunction(self.event_bus.emit):
+			# Create a task to emit the event asynchronously
+			asyncio.create_task(self.event_bus.emit(TaskResumedEvent(task_id=id(self.task))))
+		else:
+			self.event_bus.emit(TaskResumedEvent(task_id=id(self.task)))
 
 		# The signal handler should have already reset the flags
 		# through its reset() method when called from run()
