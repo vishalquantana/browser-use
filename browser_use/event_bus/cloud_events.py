@@ -14,14 +14,13 @@ from typing import Any, Literal
 from pydantic import Field
 from uuid_extensions import uuid7str
 
-from browser_use.agent.event_bus.views import Event
+from browser_use.event_bus.views import Event
 
 
 # Session lifecycle events
 class SessionStartedEvent(Event):
 	"""Emitted when a browser session starts"""
 
-	event_type: str = Field(default='session_started', frozen=True)
 	session_id: str = Field(default_factory=uuid7str)
 	user_id: str
 	browser_type: Literal['chrome', 'firefox', 'safari', 'edge'] = 'chrome'
@@ -38,7 +37,6 @@ class SessionStartedEvent(Event):
 class SessionStoppedEvent(Event):
 	"""Emitted when a browser session stops"""
 
-	event_type: str = Field(default='session_stopped', frozen=True)
 	session_id: str
 	reason: Literal['completed', 'error', 'timeout', 'user_cancelled'] = 'completed'
 	error_message: str | None = None
@@ -51,7 +49,6 @@ class SessionStoppedEvent(Event):
 class SessionBrowserStateUpdatedEvent(Event):
 	"""Emitted when browser state changes (URL, tabs, etc)"""
 
-	event_type: str = Field(default='session_browser_state_updated', frozen=True)
 	session_id: str
 	current_url: str
 	current_title: str | None = None
@@ -64,7 +61,6 @@ class SessionBrowserStateUpdatedEvent(Event):
 class TaskStartedEvent(Event):
 	"""Emitted when a new task starts within a session"""
 
-	event_type: str = Field(default='task_started', frozen=True)
 	task_id: str = Field(default_factory=uuid7str)
 	session_id: str
 	task_description: str
@@ -78,7 +74,6 @@ class TaskStartedEvent(Event):
 class TaskCompletedEvent(Event):
 	"""Emitted when a task completes"""
 
-	event_type: str = Field(default='task_completed', frozen=True)
 	task_id: str
 	session_id: str
 	status: Literal['completed', 'failed', 'cancelled', 'timeout'] = 'completed'
@@ -96,7 +91,6 @@ class TaskCompletedEvent(Event):
 class TaskPausedEvent(Event):
 	"""Emitted when a task is paused"""
 
-	event_type: str = Field(default='task_paused', frozen=True)
 	task_id: str
 	session_id: str
 	reason: str | None = None
@@ -107,7 +101,6 @@ class TaskPausedEvent(Event):
 class TaskResumedEvent(Event):
 	"""Emitted when a paused task is resumed"""
 
-	event_type: str = Field(default='task_resumed', frozen=True)
 	task_id: str
 	session_id: str
 	checkpoint_data: dict[str, Any] = Field(default_factory=dict)
@@ -116,14 +109,12 @@ class TaskResumedEvent(Event):
 class TaskStoppedEvent(Event):
 	"""Emitted when a task is stopped"""
 
-	event_type: str = Field(default='task_stopped', frozen=True)
 	task_id: str
 
 
 class StepCreatedEvent(Event):
 	"""Emitted when a step is created"""
 
-	event_type: str = Field(default='step_created', frozen=True)
 	step_id: str
 	agent_task_id: str
 	step: int
@@ -138,7 +129,6 @@ class StepCreatedEvent(Event):
 class TaskUserFeedbackEvent(Event):
 	"""Emitted when user provides feedback on a task"""
 
-	event_type: str = Field(default='task_user_feedback', frozen=True)
 	task_id: str
 	user_feedback_type: str
 	user_comment: str | None = None
@@ -147,7 +137,6 @@ class TaskUserFeedbackEvent(Event):
 class SessionBrowserDataUpdatedEvent(Event):
 	"""Emitted when browser session data is updated"""
 
-	event_type: str = Field(default='session_browser_data_updated', frozen=True)
 	session_id: str
 	browser_session_data: dict[str, Any]
 
@@ -156,7 +145,6 @@ class SessionBrowserDataUpdatedEvent(Event):
 class StepExecutedEvent(Event):
 	"""Emitted when a step is executed with full evaluation data"""
 
-	event_type: str = Field(default='step_executed', frozen=True)
 	step_id: str = Field(default_factory=uuid7str)
 	task_id: str
 	session_id: str
@@ -201,7 +189,6 @@ class StepExecutedEvent(Event):
 class StepScreenshotTakenEvent(Event):
 	"""Emitted when a screenshot is taken during a step"""
 
-	event_type: str = Field(default='step_screenshot_taken', frozen=True)
 	step_id: str
 	task_id: str
 	session_id: str
@@ -217,7 +204,6 @@ class StepScreenshotTakenEvent(Event):
 class UserFileUploadedEvent(Event):
 	"""Emitted when a user uploads a file"""
 
-	event_type: str = Field(default='user_file_uploaded', frozen=True)
 	file_id: str = Field(default_factory=uuid7str)
 	user_id: str
 	session_id: str | None = None
@@ -234,7 +220,6 @@ class UserFileUploadedEvent(Event):
 class OutputFileGeneratedEvent(Event):
 	"""Emitted when the agent generates an output file"""
 
-	event_type: str = Field(default='output_file_generated', frozen=True)
 	file_id: str = Field(default_factory=uuid7str)
 	task_id: str
 	session_id: str
@@ -253,7 +238,6 @@ class OutputFileGeneratedEvent(Event):
 class UserFeedbackProvidedEvent(Event):
 	"""Emitted when user provides feedback on a task or step"""
 
-	event_type: str = Field(default='user_feedback_provided', frozen=True)
 	feedback_id: str = Field(default_factory=uuid7str)
 	user_id: str
 	session_id: str | None = None
@@ -271,7 +255,6 @@ class UserFeedbackProvidedEvent(Event):
 class ErrorTrackedEvent(Event):
 	"""Emitted when an error occurs that should be tracked"""
 
-	event_type: str = Field(default='error_tracked', frozen=True)
 	error_id: str = Field(default_factory=uuid7str)
 	session_id: str | None = None
 	task_id: str | None = None
@@ -289,7 +272,6 @@ class ErrorTrackedEvent(Event):
 class PerformanceMetricEvent(Event):
 	"""Emitted to track performance metrics"""
 
-	event_type: str = Field(default='performance_metric', frozen=True)
 	session_id: str
 	task_id: str | None = None
 
@@ -310,7 +292,6 @@ class PerformanceMetricEvent(Event):
 class WebhookTriggeredEvent(Event):
 	"""Emitted when a condition triggers a webhook notification"""
 
-	event_type: str = Field(default='webhook_triggered', frozen=True)
 	webhook_id: str
 	session_id: str
 	task_id: str | None = None
@@ -326,7 +307,6 @@ class WebhookTriggeredEvent(Event):
 class TaskAnalyticsEvent(Event):
 	"""Aggregated analytics for a completed task"""
 
-	event_type: str = Field(default='task_analytics', frozen=True)
 	task_id: str
 	session_id: str
 

@@ -8,9 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Union
 
+import anyio
 from pydantic import BaseModel
 
-from browser_use.agent.event_bus.views import Event
+from browser_use.event_bus.views import Event
 
 logger = logging.getLogger(__name__)
 
@@ -76,39 +77,44 @@ class EventBus:
 		Returns the event object immediately with UUID but no results.
 		Can be awaited to get results when processing completes.
 		"""
-		# Convert BaseModel to Event if needed
-		if not isinstance(event, Event):
-			# Create Event from the BaseModel
-			event_data = event.model_dump()
-			event = Event(event_type=event.__class__.__name__, data=event_data)
+		# Cloud events inherit from Event, so just use them directly
+		if isinstance(event, Event):
+			self._log_event(event)
+			await self.event_queue.put(event)
+			return event
 
-		self._log_event(event)
-		await self.event_queue.put(event)
-		return event
+		# For other BaseModels, wrap in Event
+		event_data = event.model_dump()
+		wrapped_event = Event(data=event_data)
+		self._log_event(wrapped_event)
+		await self.event_queue.put(wrapped_event)
+		return wrapped_event
 
 	def enqueue_sync(self, event: BaseModel) -> Event:
 		"""
 		Enqueue an event from sync context (non-blocking).
 		Returns the event object immediately with UUID but no results.
 		"""
-		# Convert BaseModel to Event if needed
-		if not isinstance(event, Event):
-			# Create Event from the BaseModel
+		# Cloud events inherit from Event, so just use them directly
+		if isinstance(event, Event):
+			actual_event = event
+		else:
+			# For other BaseModels, wrap in Event
 			event_data = event.model_dump()
-			event = Event(event_type=event.__class__.__name__, data=event_data)
+			actual_event = Event(data=event_data)
 
-		self._log_event(event)
+		self._log_event(actual_event)
 
 		# Get or create event loop
 		try:
 			loop = asyncio.get_running_loop()
 			# If loop is running, schedule the coroutine
-			asyncio.create_task(self.event_queue.put(event))
+			asyncio.create_task(self.event_queue.put(actual_event))
 		except RuntimeError:
 			# No event loop in current thread
 			pass
 
-		return event
+		return actual_event
 
 	async def enqueue_and_wait(self, event: BaseModel) -> Event:
 		"""
@@ -322,8 +328,8 @@ class EventBus:
 			events_data.append(event_dict)
 
 		async with asyncio.Lock():
-			with open(file_path, 'w') as f:
-				json.dump(events_data, f, indent=2, default=str)
+			async with await anyio.open_file(file_path, 'w') as f:
+				await f.write(json.dumps(events_data, indent=2, default=str))
 
 	def serialize_events_to_file_sync(self, file_path: Path | str) -> None:
 		"""Serialize all events to a JSON file (sync version)
