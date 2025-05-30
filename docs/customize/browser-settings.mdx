@@ -348,16 +348,6 @@ Or run `playwright open https://example.com/ --save-storage=storage_state.json` 
 </Warning>
 
 
-#### `downloads_dir`
-
-```python
-downloads_dir: Path | str = '~/.config/browseruse/downloads'
-```
-
-Directory to save browser downloads in.
-
-(previously called `save_downloads_path` in some places)
-
 #### `profile_directory`
 
 ```python
@@ -848,10 +838,12 @@ URL filter for HAR recording.
 #### `downloads_path`
 
 ```python
-downloads_path: str | Path | None = None
+downloads_path: str | Path | None = '~/.config/browseruse/downloads'
 ```
 
-Directory to save downloads to (used by launch args).
+(aliases: `downloads_dir`, `save_downloads_path`)
+
+Local filesystem directory to save downloads to.
 
 #### `traces_dir`
 

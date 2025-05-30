@@ -1047,8 +1047,8 @@ class BrowserSession(BaseModel):
 						download = await download_info.value
 						# Determine file path
 						suggested_filename = download.suggested_filename
-						unique_filename = await self._get_unique_filename(self.browser_profile.downloads_dir, suggested_filename)
-						download_path = os.path.join(self.browser_profile.downloads_dir, unique_filename)
+						unique_filename = await self._get_unique_filename(self.browser_profile.downloads_path, suggested_filename)
+						download_path = os.path.join(self.browser_profile.downloads_path, unique_filename)
 						await download.save_as(download_path)
 						logger.debug(f'⬇️  Download triggered. Saved file to: {download_path}')
 						return download_path
@@ -1058,7 +1058,7 @@ class BrowserSession(BaseModel):
 						await page.wait_for_load_state()
 						await self._check_and_handle_navigation(page)
 				else:
-					# Standard click logic if no download is expected
+					# Standard click logic - no download wait
 					await click_func()
 					await page.wait_for_load_state()
 					await self._check_and_handle_navigation(page)
@@ -1233,7 +1233,7 @@ class BrowserSession(BaseModel):
 
 			cookies_path = Path(self.browser_profile.cookies_file)
 			if not cookies_path.is_absolute():
-				cookies_path = Path(self.browser_profile.downloads_dir or '.') / cookies_path
+				cookies_path = Path(self.browser_profile.downloads_path or '.') / cookies_path
 
 			try:
 				cookies_data = json.loads(cookies_path.read_text())
@@ -1287,9 +1287,9 @@ class BrowserSession(BaseModel):
 	# @property
 	# def saved_downloads(self) -> list[Path]:
 	# 	"""
-	# 	Return a list of files in the downloads_dir.
+	# 	Return a list of files in the downloads_path.
 	# 	"""
-	# 	return list(Path(self.browser_profile.downloads_dir).glob('*'))
+	# 	return list(Path(self.browser_profile.downloads_path).glob('*'))
 
 	async def _wait_for_stable_network(self):
 		pending_requests = set()
