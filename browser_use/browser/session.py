@@ -306,7 +306,9 @@ class BrowserSession(BaseModel):
 	async def stop(self) -> None:
 		"""Shuts down the BrowserSession, killing the browser process if keep_alive=False"""
 
-		with self._start_lock:
+		# trying to launch/kill browsers at the same time is an easy way to trash an entire user_data_dir
+		# it's worth the 1s or 2s of delay in the worst case to avoid race conditions, user_data_dir can be a few GBs
+		async with self._start_lock:
 			# save cookies to disk if cookies_file or storage_state is configured
 			await self.save_storage_state()
 
@@ -511,11 +513,10 @@ class BrowserSession(BaseModel):
 				# search for potentially conflicting local processes running on the same user_data_dir
 				for proc in psutil.process_iter(['pid', 'cmdline']):
 					if f'--user-data-dir={self.browser_profile.user_data_dir}' in (proc.info['cmdline'] or []):
-						logger.warning(
+						logger.error(
 							f'🚨 Found potentially conflicting browser process browser_pid={proc.info["pid"]} '
 							f'already running with the same user_data_dir={_log_pretty_path(self.browser_profile.user_data_dir)}'
 						)
-						# self._fork_locked_user_data_dir()
 						break
 
 				# if a user_data_dir is provided, launch a persistent context with that user_data_dir
@@ -1044,9 +1045,12 @@ class BrowserSession(BaseModel):
 				raise Exception(f'Element: {repr(element_node)} not found')
 
 			async def perform_click(click_func):
-				"""Performs the actual click, handling both download
-				and navigation scenarios."""
-				if self.browser_profile.downloads_dir:
+				"""Performs the actual click, handling both download and navigation scenarios."""
+
+				# only wait the 5s extra for potential downloads if they are enabled
+				# TODO: instead of blocking for 5s, we should register a non-block page.on('download') event
+				# and then check if the download has been triggered within the event handler
+				if self.browser_profile.downloads_path:
 					try:
 						# Try short-timeout expect_download to detect a file download has been been triggered
 						async with page.expect_download(timeout=5000) as download_info:
@@ -1059,13 +1063,13 @@ class BrowserSession(BaseModel):
 						await download.save_as(download_path)
 						logger.debug(f'⬇️  Download triggered. Saved file to: {download_path}')
 						return download_path
-					except TimeoutError:
+					except Exception:
 						# If no download is triggered, treat as normal click
 						logger.debug('No download triggered within timeout. Checking navigation...')
 						await page.wait_for_load_state()
 						await self._check_and_handle_navigation(page)
 				else:
-					# Standard click logic - no download wait
+					# If downloads are disabled, just perform the click
 					await click_func()
 					await page.wait_for_load_state()
 					await self._check_and_handle_navigation(page)
@@ -1154,6 +1158,59 @@ class BrowserSession(BaseModel):
 		"""
 		await self.save_storage_state(*args, **kwargs)
 
+	async def _save_cookies_to_file(self, cookies: list[dict[str, Any]], path: Path) -> None:
+		try:
+			cookies_file_path = Path(path or self.browser_profile.cookies_file).expanduser().resolve()
+			cookies_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+			# Write to a temporary file first
+			temp_path = cookies_file_path.with_suffix('.tmp')
+			temp_path.write_text(json.dumps(cookies, indent=4))
+
+			try:
+				# backup any existing cookies_file if one is already present
+				cookies_file_path.replace(cookies_file_path.with_suffix('.json.bak'))
+			except Exception:
+				pass
+			temp_path.replace(cookies_file_path)
+
+			logger.info(f'🍪 Saved {len(cookies)} cookies to cookies_file={_log_pretty_path(cookies_file_path)}')
+		except Exception as e:
+			logger.warning(
+				f'❌ Failed to save cookies to cookies_file={_log_pretty_path(cookies_file_path)}: {type(e).__name__}: {e}'
+			)
+
+	async def _save_storage_state_to_file(self, storage_state: dict[str, Any], path: Path) -> None:
+		try:
+			json_path = Path(path).expanduser().resolve()
+			json_path.parent.mkdir(parents=True, exist_ok=True)
+			storage_state = await self.browser_context.storage_state()
+
+			# always atomic merge storage states, never overwrite (so two browsers can share the same storage_state.json)
+			merged_storage_state = storage_state
+			if json_path.exists():
+				try:
+					existing_storage_state = json.loads(json_path.read_text())
+					merged_storage_state = merge_dicts(existing_storage_state, storage_state)
+				except Exception as e:
+					logger.error(
+						f'❌ Failed to merge updated storage_state with existing storage_state={_log_pretty_path(json_path)}: {type(e).__name__}: {e}'
+					)
+					return
+
+			# write to .tmp file first to avoid partial writes, then mv original to .bak and .tmp to original
+			temp_path = json_path.with_suffix('.json.tmp')
+			temp_path.write_text(json.dumps(merged_storage_state, indent=4))
+			try:
+				json_path.replace(json_path.with_suffix('.json.bak'))
+			except Exception:
+				pass
+			temp_path.replace(json_path)
+
+			logger.info(f'🍪 Saved {len(storage_state["cookies"])} cookies to storage_state={_log_pretty_path(json_path)}')
+		except Exception as e:
+			logger.warning(f'❌ Failed to save storage state to storage_state={_log_pretty_path(path)}: {type(e).__name__}: {e}')
+
 	@require_initialization
 	async def save_storage_state(self, path: Path | None = None) -> None:
 		"""
@@ -1161,68 +1218,53 @@ class BrowserSession(BaseModel):
 		"""
 		storage_state = await self.browser_context.storage_state()
 		cookies = storage_state['cookies']
+
+		# they passed an explicit path, only save to that path and return
+		if path:
+			if path.name == 'storage_state.json':
+				await self._save_storage_state_to_file(storage_state, path)
+				return
+			else:
+				# assume they're using the old API when path meant a cookies_file path,
+				# also save new format next to it for convenience to help them migrate
+				await self._save_cookies_to_file(cookies, path)
+				await self._save_storage_state_to_file(storage_state, path.parent / 'storage_state.json')
+				logger.warning(
+					'⚠️ cookies_file is deprecated and will be removed in a future version. '
+					'Please use storage_state="path/to/storage_state.json" instead for persisting cookies and other browser state. '
+					'See: https://playwright.dev/python/docs/api/class-browsercontext#browser-context-storage-state'
+				)
+				return
+
+		# save cookies_file if passed a cookies file path or if profile cookies_file is configured
 		if cookies and self.browser_profile.cookies_file:
 			# only show warning if they configured cookies_file (not if they passed in a path to this function as an arg)
 			logger.warning(
 				'⚠️ cookies_file is deprecated and will be removed in a future version. '
-				'Please use storage_state instead for loading cookies and other browser state. '
+				'Please use storage_state="path/to/storage_state.json" instead for persisting cookies and other browser state. '
 				'See: https://playwright.dev/python/docs/api/class-browsercontext#browser-context-storage-state'
 			)
+			await self._save_cookies_to_file(cookies, path or self.browser_profile.cookies_file)
+			await self._save_storage_state_to_file(storage_state, path.parent / 'storage_state.json')
 
-		# save cookies_file if passed a cookies file path or if profile cookies_file is configured
-		path_is_storage_state = path and str(path).endswith('storage_state.json')
-		if (path and not path_is_storage_state) or self.browser_profile.cookies_file:
-			try:
-				cookies_file_path = Path(path or self.browser_profile.cookies_file).expanduser().resolve()
-				cookies_file_path.parent.mkdir(parents=True, exist_ok=True)
-				cookies_file_path.write_text(json.dumps(cookies, indent=4))  # TODO: convert to async
-				logger.info(f'🍪 Saved {len(cookies)} cookies to cookies_file={_log_pretty_path(cookies_file_path)}')
-			except Exception as e:
-				logger.warning(
-					f'❌ Failed to save cookies to cookies_file={_log_pretty_path(cookies_file_path)}: {type(e).__name__}: {e}'
-				)
-
-		if path:
-			# if they passed in a path to the old save_cookies function,
-			# also save a new storage_state.json next to it to encourage adoption of the new format
-			storage_state_path = Path(path).expanduser().resolve().parent / 'storage_state.json'
-		else:
-			# otherwise use configured storage_state path
-			storage_state_path = self.browser_profile.storage_state
-
-		if storage_state_path is None:
-			return
-		elif not isinstance(storage_state_path, (str, Path)):
-			logger.warning('⚠️ storage_state must be a json file path to be able to update it, skipping...')
+		if self.browser_profile.storage_state is None:
 			return
 
-		try:
-			storage_state_path = Path(storage_state_path).expanduser().resolve()
-			storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-			storage_state = await self.browser_context.storage_state()
-
-			# always merge storage states, never overwrite (so two browsers can share the same storage_state.json)
-			if storage_state_path.exists():
-				try:
-					existing_storage_state = json.loads(storage_state_path.read_text())  # TODO: convert to async
-					merged_storage_state = merge_dicts(existing_storage_state, storage_state)
-					# in case another process races us and updates the file here, we will overwrite their changes
-					# if we really want to support real concurrency we need a sqlite database or something
-					storage_state_path.write_text(json.dumps(merged_storage_state, indent=4))  # TODO: convert to async
-				except Exception as e:
-					logger.warning(
-						f'❌ Failed to merge storage state with existing storage_state={_log_pretty_path(storage_state_path)}: {type(e).__name__}: {e}'
-					)
-					return
-
-			storage_state_path.write_text(json.dumps(storage_state, indent=4))  # TODO: convert to async
-			logger.info(
-				f'🍪 Saved {len(storage_state["cookies"])} cookies to storage_state={_log_pretty_path(storage_state_path)}'
-			)
-		except Exception as e:
+		if isinstance(self.browser_profile.storage_state, dict):
+			# cookies that never get updated rapidly expire or become invalid,
+			# e.g. cloudflare bumps a nonce + does a tiny proof-of-work chain on every request that gets stored back into the cookie
+			# if your cookies are frozen in time and don't update, they'll block you as a bot almost immediately
+			# if they pass a dict in it means they have to get the updated cookies manually with browser_context.cookies()
+			# and persist them manually on every change. most people don't realize they have to do that, so show a warning
 			logger.warning(
-				f'❌ Failed to save storage state to storage_state={_log_pretty_path(storage_state_path)}: {type(e).__name__}: {e}'
+				f'⚠️ storage_state was set as a {type(self.browser_profile.storage_state)} and will not be updated with any cookie changes, use a json file path instead to persist changes'
 			)
+			return
+
+		if isinstance(self.browser_profile.storage_state, (str, Path)):
+			await self._save_storage_state_to_file(storage_state, self.browser_profile.storage_state)
+
+		raise Exception(f'Got unexpected type for storage_state: {type(self.browser_profile.storage_state)}')
 
 	@require_initialization
 	async def load_storage_state(self) -> None:
