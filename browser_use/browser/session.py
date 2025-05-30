@@ -306,31 +306,38 @@ class BrowserSession(BaseModel):
 	async def stop(self) -> None:
 		"""Shuts down the BrowserSession, killing the browser process if keep_alive=False"""
 
-		self.initialized = False
+		with self._start_lock:
+			# save cookies to disk if cookies_file or storage_state is configured
+			await self.save_storage_state()
 
-		if self.browser_profile.keep_alive:
-			return  # nothing to do if keep_alive=True, leave the browser running
+			# reset connection state
+			self.initialized = False
 
-		if self.browser_context or self.browser:
-			try:
-				await (self.browser_context or self.browser).close()
-				logger.info(
-					f'🛑 Stopped the {self.browser_profile.channel.name.lower()} browser '
-					f'keep_alive=False user_data_dir={_log_pretty_path(self.browser_profile.user_data_dir) or "<incognito>"} cdp_url={self.cdp_url or self.wss_url} pid={self.browser_pid}'
-				)
-				self.browser_context = None
-			except Exception as e:
-				logger.debug(f'❌ Error closing playwright BrowserContext {self.browser_context}: {type(e).__name__}: {e}')
+			if self.browser_profile.keep_alive:
+				return  # nothing to do if keep_alive=True, leave the browser running
 
-		# kill the chrome subprocess if we were the ones that started it
-		if self.browser_pid:
-			try:
-				psutil.Process(pid=self.browser_pid).terminate()
-				logger.info(f' ↳ Killed browser subprocess with browser_pid={self.browser_pid} keep_alive=False')
-				self.browser_pid = None
-			except Exception as e:
-				if 'NoSuchProcess' not in type(e).__name__:
-					logger.debug(f'❌ Error terminating subprocess with browser_pid={self.browser_pid}: {type(e).__name__}: {e}')
+			if self.browser_context or self.browser:
+				try:
+					await (self.browser_context or self.browser).close()
+					logger.info(
+						f'🛑 Stopped the {self.browser_profile.channel.name.lower()} browser '
+						f'keep_alive=False user_data_dir={_log_pretty_path(self.browser_profile.user_data_dir) or "<incognito>"} cdp_url={self.cdp_url or self.wss_url} pid={self.browser_pid}'
+					)
+					self.browser_context = None
+				except Exception as e:
+					logger.debug(f'❌ Error closing playwright BrowserContext {self.browser_context}: {type(e).__name__}: {e}')
+
+			# kill the chrome subprocess if we were the ones that started it
+			if self.browser_pid:
+				try:
+					psutil.Process(pid=self.browser_pid).terminate()
+					logger.info(f' ↳ Killed browser subprocess with browser_pid={self.browser_pid} keep_alive=False')
+					self.browser_pid = None
+				except Exception as e:
+					if 'NoSuchProcess' not in type(e).__name__:
+						logger.debug(
+							f'❌ Error terminating subprocess with browser_pid={self.browser_pid}: {type(e).__name__}: {e}'
+						)
 
 	async def close(self) -> None:
 		"""Deprecated: Provides backwards-compatibility with old class method Browser().close()"""
