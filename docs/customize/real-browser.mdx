@@ -345,7 +345,7 @@ shared_profile = BrowserProfile(
     headless=True,
     user_data_dir=None,               # use dedicated tmp user_data_dir per session
     storage_state='/tmp/auth.json',   # load/save cookies to/from json file
-    keep_alive=True,                  # don't close the browser after the agent finishes
+    keep_alive=True,                  # don't close the browser after the agent finishes (only needed to save the session's updated cookies to disk after the run, see below)
 )
 
 window1 = BrowserSession(browser_profile=profile_a)
