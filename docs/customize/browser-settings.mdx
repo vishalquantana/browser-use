@@ -30,8 +30,8 @@ agent = Agent('fill out the form on this page', browser_session=browser_session)
 
 ## `BrowserSession`
 
-- `BrowserSession(**params)` is Browser Use's object that tracks a connection to a running browser. It sets up:
-  - the `playwright`, `browser`, `browser_context`, and `page` objects and tracks which tabs the agent/human are focused on
+- 🎭 `BrowserSession(**params)` is Browser Use's object that tracks a playwright connection to a running browser. It sets up:
+  - the `playwright` library, `browser` and/or `browser_context`, and `page` objects and tracks which tabs the agent & human are focused on
   - methods to interact with the browser window, apply config needed by the Agent, and run the `DOMService` for element detection
   - it can take a `browser_profile=BrowserProfile(...)` template containing some config defaults, and `**kwargs` session-specific config overrides
 
@@ -163,7 +163,7 @@ await asyncio.gather(agent1.run(), agent2.run())
 
 ## `BrowserProfile`
 
-A `BrowserProfile` is a config template for a `BrowserSession(...)`.
+A `BrowserProfile` is a 📋 config template for a 🎭 `BrowserSession(...)`.
 
 It's basically just a typed + validated version of a `dict` to hold config.
 
@@ -192,10 +192,22 @@ session = BrowserSession(headless=True, storage_state='auth.json', viewport={...
 - validates config at runtime quickly without having to start a browser
 - provides helper methods to autodetect screen size, set up local paths, save/load config as json, and more...
 
+<Tip>
+`BrowserProfiles`s are designed to easily be given 🆔 `uuid`s and put in a database + made editable by users. 
+`BrowserSession`s get their own 🆔 `uuid`s and be linked by 🖇 foreign key to whatever `BrowserProfiles` they use.  
+
+This cleanly separates the per-connection rows from the bulky re-usable config and avoids wasting space in your db.
+This is useful because a user may only have 2 or 3 profiles, but they could have 100k+ sessions within a few months.
+</Tip>
+
+
 `BrowserProfile` and `BrowserSession` can both take any of the:
 
 - [Playwright parameters](#playwright)
 - [Browser-Use parameters](#browser-use-parameters) (extra options we provide on top of `playwright`)
+
+The only parameters `BrowserProfile` can NOT take are the session-specific connection parameters and live playwright objects:  
+`cdp_url`, `wss_url`, `browser_pid`, `page`, `browser`, `browser_context`, `playwright`, etc.
 
 ### Basic Example
 
@@ -886,7 +898,7 @@ from browser_use import BrowserSession, BrowserProfile, Agent
 
 browser_profile = BrowserProfile(
     headless=False,
-    cookies_file="path/to/cookies.json",
+    storage_state="path/to/storage_state.json",
     wait_for_network_idle_page_load_time=3.0,
     viewport={"width": 1280, "height": 1100},
     locale='en-US',
@@ -931,6 +943,6 @@ Configuration parameters defined in both scopes consumed by these calls dependin
 - `BrowserLaunchPersistentContextArgs` - args for `playwright.BrowserType.launch_persistent_context(...)`
 - Browser Use's own internal methods
 
-For more details on Playwright's browser context options, see the [official documentation](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context).
+For more details on Playwright's browser context options, see their [launch args documentation](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context).
 
 ---
