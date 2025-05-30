@@ -412,7 +412,7 @@ class Agent(Generic[Context]):
 		self.task_id: str = uuid7str()
 
 		# Event bus
-		self.event_bus = EventBus(self)
+		self.event_bus = EventBus(name='Agent')
 
 		if self.settings.save_conversation_path:
 			logger.info(f'Saving conversation to {self.settings.save_conversation_path}')

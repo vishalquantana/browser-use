@@ -14,6 +14,7 @@ class Event(BaseModel):
 	event_id: str = Field(default_factory=uuid7str)
 	timestamp: datetime = Field(default_factory=datetime.utcnow)
 	data: dict[str, Any] = Field(default_factory=dict)
+	path: list[str] = Field(default_factory=list)
 
 	@property
 	def event_type(self) -> str:

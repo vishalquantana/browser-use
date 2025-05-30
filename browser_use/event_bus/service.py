@@ -16,7 +16,7 @@ from browser_use.event_bus.views import Event
 logger = logging.getLogger(__name__)
 
 # Type alias for event handlers
-EventHandler = Union[Callable[[Event, Any], Any], Callable[[Event, Any], Awaitable[Any]]]
+EventHandler = Union[Callable[[Event], Any], Callable[[Event], Awaitable[Any]]]
 
 
 class EventBus:
@@ -32,8 +32,8 @@ class EventBus:
 	- Serial event processing
 	"""
 
-	def __init__(self, agent_object: Any):
-		self.agent = agent_object
+	def __init__(self, name: str | None = None):
+		self.name = name or f'EventBus_{hex(id(self))[-6:]}'
 		self.event_queue: asyncio.Queue[Event] = asyncio.Queue()
 		self.write_ahead_log: list[Event] = []
 		self.handlers: dict[str, list[EventHandler]] = defaultdict(list)
@@ -43,28 +43,32 @@ class EventBus:
 		self.lock = asyncio.Lock()
 
 		# Register default logger handler
-		self.subscribe_to_all(self._default_log_handler)
+		self.on('*', self._default_log_handler)
 
-	async def _default_log_handler(self, event: Event, agent: Any) -> str:
+	async def _default_log_handler(self, event: Event) -> str:
 		"""Default handler that logs all events"""
 		logger.debug(f'Event processed: {event.event_type} [{event.event_id}] - {event.model_dump_json()}')
 		return 'logged'
 
-	def subscribe(self, event_type: str, handler: EventHandler) -> None:
-		"""Subscribe a handler to a specific event type"""
-		if not inspect.iscoroutinefunction(handler):
-			raise ValueError('Handler must be an async function')
-		self.handlers[event_type].append(handler)
+	def on(self, event_pattern: str | type[BaseModel], handler: EventHandler) -> None:
+		"""Subscribe to events matching a pattern, event type name, or event model class.
+		Use '*' for all events.
 
-	def subscribe_by_model(self, event_model: type[BaseModel], handler: EventHandler) -> None:
-		"""Subscribe a handler to a specific event model type"""
-		self.subscribe(event_model.__name__, handler)
-
-	def subscribe_to_all(self, handler: EventHandler) -> None:
-		"""Subscribe a handler to all event types"""
-		if not inspect.iscoroutinefunction(handler):
-			raise ValueError('Handler must be an async function')
-		self.all_event_handlers.append(handler)
+		Examples:
+			event_bus.on('*', handler)  # All events
+			event_bus.on('TaskStartedEvent', handler)  # Specific event type
+			event_bus.on(TaskStartedEvent, handler)  # Event model class
+		"""
+		# Allow both sync and async handlers
+		if event_pattern == '*':
+			# Subscribe to all events
+			self.all_event_handlers.append(handler)
+		elif isinstance(event_pattern, type) and issubclass(event_pattern, BaseModel):
+			# Subscribe by model class
+			self.handlers[event_pattern.__name__].append(handler)
+		else:
+			# Subscribe by string event type
+			self.handlers[str(event_pattern)].append(handler)
 
 	def _log_event(self, event: Event) -> Event:
 		"""Log an event to the write-ahead log"""
@@ -79,16 +83,19 @@ class EventBus:
 		"""
 		# Cloud events inherit from Event, so just use them directly
 		if isinstance(event, Event):
-			self._log_event(event)
-			await self.event_queue.put(event)
-			return event
+			actual_event = event
+		else:
+			# For other BaseModels, wrap in Event
+			event_data = event.model_dump()
+			actual_event = Event(data=event_data)
 
-		# For other BaseModels, wrap in Event
-		event_data = event.model_dump()
-		wrapped_event = Event(data=event_data)
-		self._log_event(wrapped_event)
-		await self.event_queue.put(wrapped_event)
-		return wrapped_event
+		# Add this EventBus to the path if not already there
+		if self.name not in actual_event.path:
+			actual_event = actual_event.model_copy(update={'path': actual_event.path + [self.name]})
+
+		self._log_event(actual_event)
+		await self.event_queue.put(actual_event)
+		return actual_event
 
 	def enqueue_sync(self, event: BaseModel) -> Event:
 		"""
@@ -102,6 +109,10 @@ class EventBus:
 			# For other BaseModels, wrap in Event
 			event_data = event.model_dump()
 			actual_event = Event(data=event_data)
+
+		# Add this EventBus to the path if not already there
+		if self.name not in actual_event.path:
+			actual_event = actual_event.model_copy(update={'path': actual_event.path + [self.name]})
 
 		self._log_event(actual_event)
 
@@ -219,6 +230,10 @@ class EventBus:
 		# Execute all handlers in parallel
 		tasks = []
 		for handler in applicable_handlers:
+			# Check for forwarding loops
+			if self._would_create_loop(handler, event):
+				logger.debug(f'Skipping {handler.__name__} to prevent loop for {event.event_type}')
+				continue
 			task = asyncio.create_task(self._safe_execute_handler(handler, event))
 			tasks.append((handler.__name__, task))
 
@@ -234,7 +249,12 @@ class EventBus:
 	async def _safe_execute_handler(self, handler: EventHandler, event: Event) -> Any:
 		"""Safely execute a single handler"""
 		try:
-			return await handler(event, self.agent)
+			if inspect.iscoroutinefunction(handler):
+				return await handler(event)
+			else:
+				# Run sync handler in thread pool to avoid blocking
+				loop = asyncio.get_event_loop()
+				return await loop.run_in_executor(None, handler, event)
 		except Exception as e:
 			logger.exception(f'Error in handler {handler.__name__} for event {event.event_id}')
 			raise
@@ -360,3 +380,209 @@ class EventBus:
 	def emit(self, event: BaseModel) -> Event:
 		"""Queue an event for processing. Can be called from sync or async context."""
 		return self.enqueue_sync(event)
+
+	def _would_create_loop(self, handler: EventHandler, event: Event) -> bool:
+		"""Check if calling this handler would create a loop"""
+		# If handler is another EventBus.emit method
+		if hasattr(handler, '__self__') and isinstance(handler.__self__, EventBus):
+			target_bus = handler.__self__
+			return target_bus.name in event.path
+		return False
+
+	def fires_on_enter(self, event_type: str | type[Event], params: Callable | None = None):
+		"""Decorator that fires an event when entering a function"""
+		from functools import wraps
+
+		def decorator(func):
+			# Get the actual event class/type
+			if isinstance(event_type, str):
+				# String event type - will create generic Event
+				event_class = Event
+				type_name = event_type
+			else:
+				# Event subclass
+				event_class = event_type
+				type_name = event_class.__name__
+
+			origin = f'{func.__qualname__}'
+
+			@wraps(func)
+			async def async_wrapper(self, *args, **kwargs):
+				# Build event parameters
+				event_params = {}
+				if params:
+					if asyncio.iscoroutinefunction(params):
+						event_params = await params(self, *args, **kwargs)
+					else:
+						event_params = params(self, *args, **kwargs)
+
+				# Create and emit event with origin as first path entry
+				if event_class == Event:
+					# Generic event with string type
+					event = Event(data={'event_type': type_name, **event_params}, path=[origin])
+				else:
+					# Specific event subclass
+					event = event_class(**event_params, path=[origin])
+
+				self.event_bus.emit(event)
+
+				# Execute the function
+				return await func(self, *args, **kwargs)
+
+			@wraps(func)
+			def sync_wrapper(self, *args, **kwargs):
+				# Build event parameters
+				event_params = {}
+				if params:
+					event_params = params(self, *args, **kwargs)
+
+				# Create and emit event with origin as first path entry
+				if event_class == Event:
+					# Generic event with string type
+					event = Event(data={'event_type': type_name, **event_params}, path=[origin])
+				else:
+					# Specific event subclass
+					event = event_class(**event_params, path=[origin])
+
+				self.event_bus.emit(event)
+
+				# Execute the function
+				return func(self, *args, **kwargs)
+
+			return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+
+		return decorator
+
+	def fires_on_exit(self, event_type: str | type[Event], params: Callable | None = None):
+		"""Decorator that fires an event when exiting a function (success or failure)"""
+		from functools import wraps
+
+		def decorator(func):
+			# Get the actual event class/type
+			if isinstance(event_type, str):
+				event_class = Event
+				type_name = event_type
+			else:
+				event_class = event_type
+				type_name = event_class.__name__
+
+			origin = f'{func.__qualname__}'
+
+			@wraps(func)
+			async def async_wrapper(self, *args, **kwargs):
+				result = None
+				error = None
+				try:
+					# Execute the function
+					result = await func(self, *args, **kwargs)
+					return result
+				except Exception as e:
+					error = e
+					raise
+				finally:
+					# Build event parameters
+					event_params = {}
+					if params:
+						if asyncio.iscoroutinefunction(params):
+							event_params = await params(self, result, *args, **kwargs)
+						else:
+							event_params = params(self, result, *args, **kwargs)
+
+					# Create and emit event
+					if event_class == Event:
+						event = Event(data={'event_type': type_name, **event_params}, path=[origin])
+					else:
+						event = event_class(**event_params, path=[origin])
+
+					self.event_bus.emit(event)
+
+			@wraps(func)
+			def sync_wrapper(self, *args, **kwargs):
+				result = None
+				error = None
+				try:
+					# Execute the function
+					result = func(self, *args, **kwargs)
+					return result
+				except Exception as e:
+					error = e
+					raise
+				finally:
+					# Build event parameters
+					event_params = {}
+					if params:
+						event_params = params(self, result, *args, **kwargs)
+
+					# Create and emit event
+					if event_class == Event:
+						event = Event(data={'event_type': type_name, **event_params}, path=[origin])
+					else:
+						event = event_class(**event_params, path=[origin])
+
+					self.event_bus.emit(event)
+
+			return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+
+		return decorator
+
+	def fires_on_error(self, event_type: str | type[Event], params: Callable | None = None):
+		"""Decorator that fires an event only when a function raises an exception"""
+		from functools import wraps
+
+		def decorator(func):
+			# Get the actual event class/type
+			if isinstance(event_type, str):
+				event_class = Event
+				type_name = event_type
+			else:
+				event_class = event_type
+				type_name = event_class.__name__
+
+			origin = f'{func.__qualname__}'
+
+			@wraps(func)
+			async def async_wrapper(self, *args, **kwargs):
+				try:
+					# Execute the function
+					return await func(self, *args, **kwargs)
+				except Exception as error:
+					# Build event parameters
+					event_params = {}
+					if params:
+						if asyncio.iscoroutinefunction(params):
+							event_params = await params(self, error, *args, **kwargs)
+						else:
+							event_params = params(self, error, *args, **kwargs)
+
+					# Create and emit event
+					if event_class == Event:
+						event = Event(data={'event_type': type_name, 'error': str(error), **event_params}, path=[origin])
+					else:
+						event = event_class(**event_params, path=[origin])
+
+					self.event_bus.emit(event)
+					raise
+
+			@wraps(func)
+			def sync_wrapper(self, *args, **kwargs):
+				try:
+					# Execute the function
+					return func(self, *args, **kwargs)
+				except Exception as error:
+					# Build event parameters
+					event_params = {}
+					if params:
+						event_params = params(self, error, *args, **kwargs)
+
+					# Create and emit event
+					if event_class == Event:
+						event = Event(data={'event_type': type_name, 'error': str(error), **event_params}, path=[origin])
+					else:
+						event = event_class(**event_params, path=[origin])
+
+					self.event_bus.emit(event)
+					raise
+
+			return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+
+		return decorator
